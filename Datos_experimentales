@@ -1,0 +1,46 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import linregress
+
+# --- Read data ---
+df = pd.read_excel("Mercury1.xlsx", skiprows=1)
+
+# --- Extract data ---
+years = np.arange(1925, 1925 + len(df))
+Omega = df["OM"].to_numpy()
+omega = df["W"].to_numpy()
+
+# --- Compute longitude of perihelion ---
+varpi = (Omega + omega) % 360  # wrap between 0–360
+varpi_unwrapped = np.unwrap(np.deg2rad(varpi))  # unwrap to avoid 360° jumps
+varpi_unwrapped_deg = np.rad2deg(varpi_unwrapped)
+
+# --- Linear regression ---
+slope, intercept, r, p, stderr = linregress(years, varpi_unwrapped_deg)
+
+# --- Predicted line ---
+fit_line = intercept + slope * years
+
+# --- Plot ---
+plt.figure(figsize=(10,6))
+plt.plot(years, varpi_unwrapped_deg, 'o', color='orange', label='Data (JPL Horizons)')
+plt.plot(years, fit_line, 'k--', label='Linear fit')
+
+# --- Fit info ---
+eq_text = (
+    f"ϖ = {intercept:.2f} + {slope:.5f} × Year\n"
+    f"Precession rate = {slope*3600*100:.2f} arcsec/century\n"
+    f"R² = {r**2:.5f}"
+)
+plt.text(years.min()+1, varpi_unwrapped_deg.min()+2, eq_text,
+         fontsize=11, bbox=dict(facecolor='white', alpha=0.7, edgecolor='gray'))
+
+# --- Labels ---
+plt.title("Mercury – Longitude of Perihelion vs Time (1925–2025)")
+plt.xlabel("Year")
+plt.ylabel("Longitude of Perihelion ϖ [degrees]")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
