@@ -1,0 +1,63 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.animation import FuncAnimation
+
+# --- Read data ---
+df = pd.read_excel("Mercury1.xlsx", skiprows=1)
+
+# --- Extract columns ---
+a = df["A"].to_numpy()
+e = df["EC"].to_numpy()
+i = np.deg2rad(df["IN"].to_numpy())
+Omega = np.deg2rad(df["OM"].to_numpy())
+omega = np.deg2rad(df["W"].to_numpy())
+years = np.arange(1925, 1925 + len(a))
+
+# --- Function to compute 3D orbit from elements ---
+def compute_orbit(a, e, i, Omega, omega):
+    theta = np.linspace(0, 2*np.pi, 300)
+    r = a * (1 - e**2) / (1 + e * np.cos(theta))
+    X = r * (np.cos(Omega) * np.cos(omega + theta) - np.sin(Omega) * np.sin(omega + theta) * np.cos(i))
+    Y = r * (np.sin(Omega) * np.cos(omega + theta) + np.cos(Omega) * np.sin(omega + theta) * np.cos(i))
+    Z = r * np.sin(i) * np.sin(omega + theta)
+    return X, Y, Z
+
+# --- Compute first orbit as reference ---
+X0, Y0, Z0 = compute_orbit(a[0], e[0], i[0], Omega[0], omega[0])
+
+# --- Prepare figure ---
+fig = plt.figure(figsize=(8, 8))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_xlim(-7e7, 7e7)
+ax.set_ylim(-7e7, 7e7)
+ax.set_zlim(-7e7, 7e7)
+ax.set_xlabel('X [km]')
+ax.set_ylabel('Y [km]')
+ax.set_zlabel('Z [km]')
+ax.set_title("Mercury's Orbit Precession (1925–2025)")
+
+# Sun
+ax.scatter(0, 0, 0, color='yellow', s=200, label='Sun')
+
+# Plot reference orbit (first one)
+ax.plot(X0, Y0, Z0, color='gray', linestyle='--', linewidth=1.5, label='1925 Orbit')
+
+# Line object for current orbit
+orbit_line, = ax.plot([], [], [], color='orange', linewidth=2)
+year_text = ax.text2D(0.05, 0.9, "", transform=ax.transAxes, fontsize=12)
+
+# --- Animation function ---
+def update(frame):
+    X, Y, Z = compute_orbit(a[frame], e[frame], i[frame], Omega[frame], omega[frame])
+    orbit_line.set_data(X, Y)
+    orbit_line.set_3d_properties(Z)
+    year_text.set_text(f"Year: {years[frame]}")
+    return orbit_line, year_text
+
+# --- Animate ---
+ani = FuncAnimation(fig, update, frames=len(a), interval=150, blit=False, repeat=True)
+
+plt.legend()
+plt.show()
