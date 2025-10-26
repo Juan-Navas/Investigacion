@@ -1,0 +1,252 @@
+# nbody_mercury_1PN.py
+# N-body (Sun, Mercury, Venus, Earth, Jupiter) with:
+#  - Newtonian mutual gravity,
+#  - optional Sun J2 on Mercury,
+#  - optional 1PN Schwarzschild correction on Mercury.
+#
+# Requirements:
+#   pip install numpy pandas scipy matplotlib openpyxl
+
+import numpy as np
+import pandas as pd
+from scipy.integrate import solve_ivp
+from scipy.stats import linregress
+import matplotlib.pyplot as plt
+
+# ---------------- Constants ----------------
+GM = {
+    'Sun': 1.32712440018e11,    # km^3/s^2
+    'Mercury': 22031.868551,
+    'Venus': 324858.592000,
+    'Earth': 398600.435507,
+    'Jupiter': 126712764.8
+}
+c_km_s = 299792.458  # km/s
+J2_sun = 2.0e-7
+R_sun_km = 695700.0
+
+# ---------------- Elements <-> state helpers ----------------
+def elements_to_state(a, e, inc_deg, Omega_deg, omega_deg, nu_deg, mu=GM['Sun']):
+    i = np.deg2rad(inc_deg); Omega = np.deg2rad(Omega_deg)
+    omega = np.deg2rad(omega_deg); nu = np.deg2rad(nu_deg)
+    p = a * (1 - e**2)
+    r = p / (1 + e * np.cos(nu))
+    r_pf = np.array([r * np.cos(nu), r * np.sin(nu), 0.0])
+    v_pf = np.array([-np.sqrt(mu/p) * np.sin(nu), np.sqrt(mu/p) * (e + np.cos(nu)), 0.0])
+    cosO = np.cos(Omega); sinO = np.sin(Omega)
+    cosw = np.cos(omega); sinw = np.sin(omega)
+    cosi = np.cos(i); sini = np.sin(i)
+    R = np.array([
+        [ cosO*cosw - sinO*sinw*cosi,  -cosO*sinw - sinO*cosw*cosi,  sinO*sini],
+        [ sinO*cosw + cosO*sinw*cosi,  -sinO*sinw + cosO*cosw*cosi, -cosO*sini],
+        [ sinw*sini,                     cosw*sini,                   cosi     ]
+    ])
+    r_vec = R @ r_pf
+    v_vec = R @ v_pf
+    return r_vec, v_vec
+
+def state_to_elements(r_vec, v_vec, mu=GM['Sun']):
+    r = np.array(r_vec); v = np.array(v_vec)
+    r_norm = np.linalg.norm(r); v_norm = np.linalg.norm(v)
+    h = np.cross(r, v); h_norm = np.linalg.norm(h)
+    K = np.array([0.,0.,1.])
+    n = np.cross(K, h); n_norm = np.linalg.norm(n)
+    e_vec = (1/mu) * ((v_norm**2 - mu/r_norm) * r - np.dot(r, v) * v)
+    e = np.linalg.norm(e_vec)
+    eps = v_norm**2/2 - mu/r_norm
+    a = -mu / (2*eps) if abs(eps) > 0 else np.inf
+    i_deg = np.rad2deg(np.arccos(h[2]/h_norm))
+    Omega_deg = 0.0
+    if n_norm > 1e-12:
+        Omega_deg = (np.rad2deg(np.arctan2(n[1], n[0])) ) % 360.0
+    omega_deg = 0.0
+    if n_norm > 1e-12 and e > 1e-12:
+        cosw = np.clip(np.dot(n, e_vec)/(n_norm*e), -1.0, 1.0)
+        omega_deg = np.rad2deg(np.arccos(cosw))
+        if np.dot(np.cross(n, e_vec), h) < 0:
+            omega_deg = 360.0 - omega_deg
+    elif e > 1e-12:
+        omega_deg = np.rad2deg(np.arctan2(e_vec[1], e_vec[0])) % 360.0
+    nu_deg = 0.0
+    if e > 1e-12:
+        cosnu = np.clip(np.dot(e_vec, r)/(e*r_norm), -1.0, 1.0)
+        nu_deg = np.rad2deg(np.arccos(cosnu))
+        if np.dot(r, v) < 0: nu_deg = 360.0 - nu_deg
+    return a, e, i_deg, Omega_deg, omega_deg, nu_deg
+
+# ---------------- J2 on Mercury ----------------
+def acc_J2_on_body(r_rel, J2=J2_sun, R=R_sun_km, mu=GM['Sun'], k_unit=np.array([0.,0.,1.])):
+    r = np.array(r_rel)
+    r_norm = np.linalg.norm(r)
+    if r_norm == 0: return np.zeros(3)
+    s = np.dot(k_unit, r)
+    a1 = - (3*mu*J2*R*2) / (2 * r_norm7) * ( (r_norm2 - 5*s*2) * r )
+    a2 = - (3*mu*J2*R*2) / (r_norm*5) * s * k_unit
+    return a1 + a2
+
+# ---------------- 1PN correction for test particle in Sun field (Mercury) ----------------
+def acc_1PN_schwarzschild(r_rel, v_rel, mu=GM['Sun'], c=c_km_s):
+    """
+    r_rel, v_rel: Mercury position & velocity relative to Sun (km, km/s)
+    Returns 1PN acceleration vector in km/s^2 (approximate Schwarzschild 1PN term).
+    Formula: a_1PN = (GM/c^2 r^3) [ (4 GM / r - v^2) r + 4 (r·v) v ]
+    """
+    r = np.array(r_rel); v = np.array(v_rel)
+    r_norm = np.linalg.norm(r)
+    if r_norm == 0:
+        return np.zeros(3)
+    v2 = np.dot(v, v)
+    rdotv = np.dot(r, v)
+    pref = mu / (c*2 * r_norm*3)
+    term_r = (4.0 * mu / r_norm - v2) * r
+    term_v = 4.0 * rdotv * v
+    return pref * (term_r + term_v)
+
+# ---------------- Read first-row elements ----------------
+def read_first_row_elements_xlsx(filename):
+    df = pd.read_excel(filename, skiprows=1, engine='openpyxl')
+    row = df.iloc[0]
+    a = float(row['A']); e = float(row['EC'])
+    inc = float(row['IN']); Om = float(row['OM'])
+    w = float(row['W']); TA = float(row['TA'])
+    return a, e, inc, Om, w, TA
+
+# ---------------- Build initial state ----------------
+def build_initial_state(file_map):
+    names = []
+    states = []
+    for name, fname in file_map:
+        names.append(name)
+        if name == 'Sun':
+            r0 = np.array([0.0,0.0,0.0]); v0 = np.array([0.0,0.0,0.0])
+        else:
+            a,e,inc,Om,w,TA = read_first_row_elements_xlsx(fname)
+            r0, v0 = elements_to_state(a,e,inc,Om,w,TA)
+        states.append(np.hstack((r0, v0)))
+    y0 = np.hstack(states)
+    return names, y0
+
+# ---------------- N-body derivative with optional J2 and 1PN on Mercury ----------------
+def nbody_derivative(t, y, names, gm_dict, use_J2_mercury=True, J2_val=J2_sun, use_1PN_mercury=True):
+    N = len(names)
+    dydt = np.zeros_like(y)
+    pos = y.reshape(N,6)[:,0:3]
+    vel = y.reshape(N,6)[:,3:6]
+    acc = np.zeros_like(pos)
+    # mutual Newtonian acceleration
+    for i in range(N):
+        ri = pos[i]
+        ai = np.zeros(3)
+        for j in range(N):
+            if i == j: continue
+            rj = pos[j]
+            r_ij = ri - rj
+            dist3 = np.linalg.norm(r_ij)**3
+            if dist3 == 0: continue
+            mu_j = gm_dict[names[j]]
+            ai += - mu_j * r_ij / dist3
+        acc[i] = ai
+    # J2 on Mercury only
+    if use_J2_mercury:
+        try:
+            im = names.index('Mercury'); isun = names.index('Sun')
+            r_mer = pos[im]; r_sun = pos[isun]
+            r_rel = r_mer - r_sun
+            a_j2 = acc_J2_on_body(r_rel, J2=J2_val, R=R_sun_km, mu=gm_dict['Sun'])
+            acc[im] += a_j2
+        except ValueError:
+            pass
+    # 1PN on Mercury only (Schwarzschild)
+    if use_1PN_mercury:
+        try:
+            im = names.index('Mercury'); isun = names.index('Sun')
+            r_mer = pos[im]; v_mer = vel[im]
+            r_sun = pos[isun]; v_sun = vel[isun]
+            r_rel = r_mer - r_sun
+            v_rel = v_mer - v_sun
+            a_1pn = acc_1PN_schwarzschild(r_rel, v_rel, mu=gm_dict['Sun'], c=c_km_s)
+            acc[im] += a_1pn
+        except ValueError:
+            pass
+    # pack derivatives
+    for i in range(N):
+        idx = 6*i
+        dydt[idx:idx+3] = vel[i]
+        dydt[idx+3:idx+6] = acc[i]
+    return dydt
+
+# ---------------- Perihelion detection & workflow (same idea as before) ----------------
+def run_nbody_with_1pn(files, t_years=100, dt_days=1.0, use_J2_mercury=True, use_1PN_mercury=True):
+    names, y0 = build_initial_state(files)
+    N = len(names)
+    print("Bodies:", names)
+    t0 = 0.0
+    t_end = t_years * 365.25 * 86400.0
+    dt = dt_days * 86400.0
+    t_eval = np.arange(t0, t_end+0.1*dt, dt)
+    sol = solve_ivp(lambda t,y: nbody_derivative(t,y,names,GM,use_J2_mercury,J2_sun,use_1PN_mercury),
+                    (t0, t_end), y0, t_eval=t_eval, rtol=1e-9, atol=1e-12, method='DOP853')
+    if not sol.success:
+        raise RuntimeError("Integration failed: "+sol.message)
+    Nt = sol.y.shape[1]
+    pos = sol.y.reshape(N,6,Nt)[:,0:3,:]
+    # Mercury and Sun indices
+    im = names.index('Mercury'); isun = names.index('Sun')
+    r_mer_rel = pos[im,:,:] - pos[isun,:,:]   # shape (3,Nt)
+    rnorm = np.linalg.norm(r_mer_rel, axis=0)
+    minima = []
+    for k in range(1, Nt-1):
+        if rnorm[k] < rnorm[k-1] and rnorm[k] < rnorm[k+1]:
+            minima.append(k)
+    # filter minima (min separation ~ 30 days)
+    dt_sec = sol.t[1] - sol.t[0]
+    min_sep_idx = int(max(1, (30*86400.0)/dt_sec))
+    filtered = []
+    last = -999999
+    for idx in minima:
+        if idx - last >= min_sep_idx:
+            filtered.append(idx)
+            last = idx
+    peri_idxs = np.array(filtered, dtype=int)
+    print("Detected perihelia:", len(peri_idxs))
+    # compute varpi at each perihelion
+    years = 1925.0 + (sol.t[peri_idxs]/86400.0)/365.25
+    varpi_list = []
+    for idx in peri_idxs:
+        r_mer = sol.y[6*im + 0:6*im + 3, idx]
+        v_mer = sol.y[6*im + 3:6*im + 6, idx]
+        r_sun = sol.y[6*isun + 0:6*isun + 3, idx]
+        v_sun = sol.y[6*isun + 3:6*isun + 6, idx]
+        r_rel = r_mer - r_sun; v_rel = v_mer - v_sun
+        a, e, inc, Om, w, nu = state_to_elements(r_rel, v_rel, mu=GM['Sun'])
+        varpi = (Om + w) % 360.0
+        varpi_list.append(varpi)
+    varpi_arr = np.array(varpi_list)
+    varpi_unw = np.rad2deg(np.unwrap(np.deg2rad(varpi_arr)))
+    slope_deg_per_year, intercept, r_val, p, stderr = linregress(years, varpi_unw)
+    precession_arcsec_per_century = slope_deg_per_year * 3600.0 * 100.0
+    print(f"Linear fit: varpi = {intercept:.6f} + {slope_deg_per_year:.8e} * Year")
+    print(f"Precession = {precession_arcsec_per_century:.4f} arcsec/century (R^2={r_val**2:.6f})")
+    # plot
+    plt.figure(figsize=(10,5))
+    plt.plot(years, varpi_unw, 'o', ms=4, label='Simulated perihelia (varpi)')
+    fit_line = intercept + slope_deg_per_year * years
+    plt.plot(years, fit_line, 'k--', label=f'Fit: {precession_arcsec_per_century:.3f} arcsec/century')
+    plt.xlabel('Year'); plt.ylabel('Longitude of perihelion ϖ [deg]')
+    plt.title('Mercury — simulated perihelion longitudes (N-body + 1PN) and linear fit')
+    eq_text = f"ϖ = {intercept:.3f} + {slope_deg_per_year:.6e} Year\n{precession_arcsec_per_century:.3f} arcsec/century"
+    plt.text(years.min()+1, varpi_unw.min()+0.5, eq_text, bbox=dict(facecolor='white', alpha=0.8))
+    plt.grid(True); plt.legend(); plt.show()
+    return {'years': years, 'varpi_deg': varpi_unw, 'precession_arcsec_per_century': precession_arcsec_per_century}
+
+# ---------------- Example run ----------------
+if _name_ == "_main_":
+    files = [
+        ('Sun', None),
+        ('Mercury', 'Mercury1.xlsx'),
+        ('Venus', 'Venus1.xlsx'),
+        ('Earth', 'Earth1.xlsx'),
+        ('Jupiter', 'Jupiter1.xlsx')
+    ]
+    res = run_nbody_with_1pn(files, t_years=100, dt_days=1.0, use_J2_mercury=True, use_1PN_mercury=True)
+    print("Result (arcsec/century):", res['precession_arcsec_per_century'])
