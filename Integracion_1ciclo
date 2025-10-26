@@ -1,0 +1,354 @@
+# compare_mercury_orbit.py
+# Integra y compara la órbita de Mercurio (N-body + J2 + 1PN) con datos "Total" de JPL
+# Run: python compare_mercury_orbit.py
+# Requires: numpy, pandas, scipy, matplotlib, openpyxl
+
+import numpy as np
+import pandas as pd
+from scipy.integrate import solve_ivp
+from scipy.stats import linregress
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+
+# ---------------- Constants ----------------
+GM = {
+    'Sun': 1.32712440018e11,    # km^3/s^2
+    'Mercury': 22031.868551,
+    'Venus': 324858.592000,
+    'Earth': 398600.435507,
+    'Jupiter': 126712764.8
+}
+c_km_s = 299792.458  # km/s
+J2_sun = 2.0e-7
+R_sun_km = 695700.0
+
+# ---------------- Helpers: elements <-> state ----------------
+def elements_to_state(a, e, inc_deg, Omega_deg, omega_deg, nu_deg, mu=GM['Sun']):
+    """Devuelve r_vec (km) y v_vec (km/s) en marco heliocéntrico eclíptico."""
+    i = np.deg2rad(inc_deg); Omega = np.deg2rad(Omega_deg)
+    omega = np.deg2rad(omega_deg); nu = np.deg2rad(nu_deg)
+    p = a * (1 - e**2)
+    r = p / (1 + e * np.cos(nu))
+    # coordenadas en el plano perifocal
+    r_pf = np.array([r * np.cos(nu), r * np.sin(nu), 0.0])
+    v_pf = np.array([-np.sqrt(mu/p) * np.sin(nu), np.sqrt(mu/p) * (e + np.cos(nu)), 0.0])
+    # matriz de rotación (perifocal -> inercial eclíptico)
+    cosO = np.cos(Omega); sinO = np.sin(Omega)
+    cosw = np.cos(omega); sinw = np.sin(omega)
+    cosi = np.cos(i); sini = np.sin(i)
+    R = np.array([
+        [ cosO*cosw - sinO*sinw*cosi,  -cosO*sinw - sinO*cosw*cosi,  sinO*sini],
+        [ sinO*cosw + cosO*sinw*cosi,  -sinO*sinw + cosO*cosw*cosi, -cosO*sini],
+        [ sinw*sini,                     cosw*sini,                   cosi     ]
+    ])
+    r_vec = R @ r_pf
+    v_vec = R @ v_pf
+    return r_vec, v_vec
+
+def state_to_elements(r_vec, v_vec, mu=GM['Sun']):
+    """Devuelve elementos (a, e, i_deg, Omega_deg, omega_deg, nu_deg) desde estado heliocéntrico."""
+    r = np.array(r_vec); v = np.array(v_vec)
+    r_norm = np.linalg.norm(r); v_norm = np.linalg.norm(v)
+    h = np.cross(r, v); h_norm = np.linalg.norm(h)
+    K = np.array([0.,0.,1.])
+    n = np.cross(K, h); n_norm = np.linalg.norm(n)
+    e_vec = (1/mu) * ((v_norm**2 - mu/r_norm) * r - np.dot(r, v) * v)
+    e = np.linalg.norm(e_vec)
+    eps = v_norm**2/2 - mu/r_norm
+    a = -mu / (2*eps) if abs(eps) > 0 else np.inf
+    i_deg = np.rad2deg(np.arccos(h[2]/h_norm))
+    Omega_deg = 0.0
+    if n_norm > 1e-12:
+        Omega_deg = (np.rad2deg(np.arctan2(n[1], n[0])) ) % 360.0
+    omega_deg = 0.0
+    if n_norm > 1e-12 and e > 1e-12:
+        cosw = np.clip(np.dot(n, e_vec)/(n_norm*e), -1.0, 1.0)
+        omega_deg = np.rad2deg(np.arccos(cosw))
+        if np.dot(np.cross(n, e_vec), h) < 0:
+            omega_deg = 360.0 - omega_deg
+    elif e > 1e-12:
+        omega_deg = np.rad2deg(np.arctan2(e_vec[1], e_vec[0])) % 360.0
+    nu_deg = 0.0
+    if e > 1e-12:
+        cosnu = np.clip(np.dot(e_vec, r)/(e*r_norm), -1.0, 1.0)
+        nu_deg = np.rad2deg(np.arccos(cosnu))
+        if np.dot(r, v) < 0:
+            nu_deg = 360.0 - nu_deg
+    return a, e, i_deg, Omega_deg, omega_deg, nu_deg
+
+# ---------------- J2 on Mercury ----------------
+def acc_J2_on_body(r_rel, J2=J2_sun, R=R_sun_km, mu=GM['Sun'], k_unit=np.array([0.,0.,1.])):
+    r = np.array(r_rel)
+    r_norm = np.linalg.norm(r)
+    if r_norm == 0.0:
+        return np.zeros(3)
+    s = np.dot(k_unit, r)
+    # fórmula standard:
+    a1 = - (3.0 * mu * J2 * R*2) / (2.0 * r_norm7) * ( (r_norm2 - 5.0*s*2) * r )
+    a2 = - (3.0 * mu * J2 * R*2) / ( r_norm*5 ) * s * k_unit
+    return a1 + a2
+
+# ---------------- 1PN correction (Schwarzschild) para Mercury ----------------
+def acc_1PN_schwarzschild(r_rel, v_rel, mu=GM['Sun'], c=c_km_s):
+    r = np.array(r_rel); v = np.array(v_rel)
+    r_norm = np.linalg.norm(r)
+    if r_norm == 0.0:
+        return np.zeros(3)
+    v2 = np.dot(v, v)
+    rdotv = np.dot(r, v)
+    pref = mu / (c*2 * r_norm*3)
+    term_r = (4.0 * mu / r_norm - v2) * r
+    term_v = 4.0 * rdotv * v
+    return pref * (term_r + term_v)
+
+# ---------------- Read the "Total" excel files and find row at start date ----------------
+def read_total_file_get_epoch_state(filename, start_dt):
+    """
+    filename: .xlsx with columns including 'Calendar Date (TDB)', 'A', 'EC', 'IN', 'OM', 'W', 'TA'
+    start_dt: python datetime for start (UTC/TDB string parsed)
+    Returns: r0 (km), v0 (km/s) computed from the elements at that date
+    """
+    df = pd.read_excel(filename, skiprows=1, engine='openpyxl')
+    # parse calendar column
+    if 'Calendar Date (TDB)' not in df.columns:
+        raise ValueError(f"No 'Calendar Date (TDB)' column in {filename}")
+    # try to parse the calendar strings into datetimes
+    # HORIZONS format: "A.D. 2025-Jul-23 00:00:00.0000"
+    def parse_horizons_date(s):
+        if pd.isna(s):
+            return None
+        s = str(s).strip()
+        # remove leading "A.D." or similar
+        s = s.replace("A.D.", "").replace("A.D", "").strip()
+        # replace multiple spaces
+        s = " ".join(s.split())
+        # try several formats
+        for fmt in ("%Y-%b-%d %H:%M:%S.%f", "%Y-%b-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%b-%d %H:%M:%S.%f000"):
+            try:
+                return datetime.strptime(s, fmt)
+            except Exception:
+                pass
+        # some Horizons exports may contain "2025-Jul-23 00:00:00.0000" directly
+        try:
+            # try locale-independent: split month name
+            parts = s.split()
+            if len(parts) >= 3:
+                # e.g. "2025-Jul-23 00:00:00.0000"
+                datepart = parts[0]
+                # if first token not numeric, rejoin tokens
+            return datetime.fromisoformat(s)
+        except Exception:
+            return None
+
+    cal_dates = df['Calendar Date (TDB)'].astype(str).apply(parse_horizons_date)
+    # find nearest row to start_dt
+    diffs = cal_dates.apply(lambda x: abs((x - start_dt).total_seconds()) if x is not None else 1e20)
+    idx = diffs.idxmin()
+    row = df.loc[idx]
+    # read elements
+    a = float(row['A']); e = float(row['EC'])
+    inc = float(row['IN']); Om = float(row['OM'])
+    w = float(row['W']); TA = float(row['TA'])
+    r0, v0 = elements_to_state(a, e, inc, Om, w, TA)
+    return r0, v0
+
+# ---------------- Build initial N-body state at start epoch ----------------
+def build_initial_state_from_totals(start_dt, files_map):
+    """
+    files_map: dict name -> filename for Mercury, Venus, Earth, Jupiter
+    returns: names list (['Sun','Mercury',...]), y0 vector
+    """
+    names = ['Sun', 'Mercury', 'Venus', 'Earth', 'Jupiter']
+    states = []
+    # Sun at origin, zero vel
+    states.append(np.hstack((np.array([0.0,0.0,0.0]), np.array([0.0,0.0,0.0]))))
+    for name in names[1:]:
+        r0, v0 = read_total_file_get_epoch_state(files_map[name], start_dt)
+        states.append(np.hstack((r0, v0)))
+    y0 = np.hstack(states)
+    return names, y0
+
+# ---------------- N-body derivative with J2 and 1PN for Mercury ----------------
+def nbody_derivative(t, y, names, gm_dict, use_J2_mercury=True, J2_val=J2_sun, use_1PN_mercury=True):
+    N = len(names)
+    dydt = np.zeros_like(y)
+    pos = y.reshape(N,6)[:,0:3]
+    vel = y.reshape(N,6)[:,3:6]
+    acc = np.zeros_like(pos)
+    # mutual Newtonian accelerations: each body i feels sum_j != i -GM_j (r_i - r_j)/|r_i - r_j|^3
+    for i in range(N):
+        ri = pos[i]
+        ai = np.zeros(3)
+        for j in range(N):
+            if i == j: continue
+            rj = pos[j]
+            r_ij = ri - rj
+            dist3 = np.linalg.norm(r_ij)**3
+            if dist3 == 0.0: continue
+            mu_j = gm_dict[names[j]]
+            ai += - mu_j * r_ij / dist3
+        acc[i] = ai
+    # add J2 on Mercury only (use Mercury - Sun vector)
+    if use_J2_mercury:
+        try:
+            im = names.index('Mercury'); isun = names.index('Sun')
+            r_rel = pos[im] - pos[isun]
+            a_j2 = acc_J2_on_body(r_rel, J2=J2_val, R=R_sun_km, mu=gm_dict['Sun'])
+            acc[im] += a_j2
+        except ValueError:
+            pass
+    # add 1PN on Mercury only (Schwarzschild)
+    if use_1PN_mercury:
+        try:
+            im = names.index('Mercury'); isun = names.index('Sun')
+            r_rel = pos[im] - pos[isun]
+            v_rel = vel[im] - vel[isun]
+            a_1pn = acc_1PN_schwarzschild(r_rel, v_rel, mu=gm_dict['Sun'], c=c_km_s)
+            acc[im] += a_1pn
+        except ValueError:
+            pass
+    # pack derivatives
+    for i in range(N):
+        idx = 6*i
+        dydt[idx:idx+3] = vel[i]
+        dydt[idx+3:idx+6] = acc[i]
+    return dydt
+
+# ---------------- Build "experimental" JPL positions from the Total file for the interval ----------------
+def build_jpl_positions_from_total(filename, start_dt, end_dt, step_seconds=3600):
+    """
+    Return arrays t_seconds (since start_dt), X,Y,Z (km) built from file elements by converting each row's A,EC,IN,OM,W,TA -> r_vec.
+    If file has hourly rows matching the interval, uses them. Otherwise, interpolates/extraps nearest.
+    """
+    df = pd.read_excel(filename, skiprows=1, engine='openpyxl')
+    # parse dates
+    def parse_h(s):
+        if pd.isna(s):
+            return None
+        s = str(s).strip().replace("A.D.","").strip()
+        try:
+            return datetime.strptime(s, "%Y-%b-%d %H:%M:%S.%f")
+        except Exception:
+            try:
+                return datetime.strptime(s, "%Y-%b-%d %H:%M:%S")
+            except Exception:
+                try:
+                    return datetime.fromisoformat(s)
+                except Exception:
+                    return None
+    cal_dates = df['Calendar Date (TDB)'].astype(str).apply(parse_h)
+    df['_dt_'] = cal_dates
+    # select rows within [start_dt, end_dt] or nearest
+    mask = df['_dt_'].notnull()
+    df_valid = df[mask].copy()
+    if df_valid.empty:
+        raise ValueError("No valid date rows in " + filename)
+    # build time grid requested
+    t_grid = []
+    cur = start_dt
+    while cur <= end_dt + timedelta(seconds=1):
+        t_grid.append(cur)
+        cur += timedelta(seconds=step_seconds)
+    t_grid = np.array(t_grid)
+    X = np.zeros(len(t_grid)); Y = np.zeros(len(t_grid)); Z = np.zeros(len(t_grid))
+    # for each target time, find nearest row in df_valid and get r
+    for i, tg in enumerate(t_grid):
+        # closest index
+        diffs = df_valid['_dt_'].apply(lambda x: abs((x - tg).total_seconds()))
+        idx = diffs.idxmin()
+        row = df_valid.loc[idx]
+        a = float(row['A']); e = float(row['EC']); inc = float(row['IN'])
+        Om = float(row['OM']); w = float(row['W']); TA = float(row['TA'])
+        rvec, vvec = elements_to_state(a, e, inc, Om, w, TA)
+        X[i], Y[i], Z[i] = rvec
+    t_seconds = np.array([(tg - start_dt).total_seconds() for tg in t_grid])
+    return t_seconds, X, Y, Z, t_grid
+
+# ---------------- Main runner: integrate and compare ----------------
+def integrate_and_compare(start_str="2025-07-23 00:00:00", end_str="2025-10-19 00:00:00",
+                          dt_seconds=3600, files_map=None, save_prefix="mercury_compare"):
+    # parse dates (assume input in YYYY-MM-DD HH:MM:SS)
+    start_dt = datetime.fromisoformat(start_str)
+    end_dt = datetime.fromisoformat(end_str)
+    # build initial state from files at start epoch
+    names, y0 = build_initial_state_from_totals(start_dt, files_map)
+    print("Initial bodies order:", names)
+    t0 = 0.0
+    t_end = (end_dt - start_dt).total_seconds()
+    t_eval = np.arange(t0, t_end + 0.1*dt_seconds, dt_seconds)
+    print("Integrating from", start_dt, "to", end_dt, "steps:", len(t_eval))
+    sol = solve_ivp(lambda t, y: nbody_derivative(t, y, names, GM, use_J2_mercury=True, J2_val=J2_sun, use_1PN_mercury=True),
+                    (t0, t_end), y0, t_eval=t_eval, rtol=1e-9, atol=1e-12, method='DOP853')
+    if not sol.success:
+        raise RuntimeError("Integration failed: " + sol.message)
+    Nt = sol.y.shape[1]
+    # extract Mercury positions relative to Sun (both arrays)
+    im = names.index('Mercury'); isun = names.index('Sun')
+    # positions arrays shaped (3, Nt)
+    pos_mer = sol.y[6*im+0:6*im+3, :]
+    pos_sun = sol.y[0:3, :]
+    r_mer_rel = pos_mer - pos_sun  # (3, Nt)
+    X_sim = r_mer_rel[0, :]; Y_sim = r_mer_rel[1, :]; Z_sim = r_mer_rel[2, :]
+    # build JPL positions from MercurioTotal file
+    t_jpl_sec, X_jpl, Y_jpl, Z_jpl, times_jpl = build_jpl_positions_from_total(files_map['Mercury'], start_dt, end_dt, step_seconds=dt_seconds)
+    # sanity: lengths should match (both hourly). If not, resample/interpolate simulation to match JPL times
+    if len(t_jpl_sec) != Nt:
+        # interpolate sim onto jpl times
+        from scipy.interpolate import interp1d
+        itp_x = interp1d(sol.t, X_sim, kind='cubic', fill_value='extrapolate')
+        itp_y = interp1d(sol.t, Y_sim, kind='cubic', fill_value='extrapolate')
+        itp_z = interp1d(sol.t, Z_sim, kind='cubic', fill_value='extrapolate')
+        X_sim_resamp = itp_x(t_jpl_sec)
+        Y_sim_resamp = itp_y(t_jpl_sec)
+        Z_sim_resamp = itp_z(t_jpl_sec)
+        t_plot = t_jpl_sec
+    else:
+        X_sim_resamp = X_sim; Y_sim_resamp = Y_sim; Z_sim_resamp = Z_sim
+        t_plot = sol.t
+    # Convert times to matplotlib-friendly datetimes for plotting
+    times_plot_dt = [start_dt + timedelta(seconds=float(s)) for s in t_plot]
+    # Plot XY comparison
+    plt.figure(figsize=(8,8))
+    plt.plot(X_jpl, Y_jpl, linestyle='--', color='tab:blue', label='JPL (experimental)')
+    plt.plot(X_sim_resamp, Y_sim_resamp, linestyle='-', color='tab:orange', label='Simulación (N-body + J2 + 1PN)')
+    plt.scatter(X_jpl[0], Y_jpl[0], color='blue', marker='o', label='Inicio (JPL)')
+    plt.scatter(X_sim_resamp[0], Y_sim_resamp[0], color='orange', marker='x', label='Inicio (sim)')
+    plt.xlabel('X [km]'); plt.ylabel('Y [km]'); plt.axis('equal')
+    plt.legend(); plt.title('Mercurio: simulación vs JPL (XY) — 1 órbita (~88 días)')
+    plt.grid(True)
+    plt.savefig(f"{save_prefix}_XY_compare.png", dpi=300, bbox_inches='tight')
+    plt.show()
+    # Plot residual radial difference vs time
+    resid_radial = np.sqrt((X_sim_resamp - X_jpl)*2 + (Y_sim_resamp - Y_jpl)*2)
+    plt.figure(figsize=(10,4))
+    plt.plot(times_plot_dt, resid_radial, '-', color='purple')
+    plt.xlabel('Fecha (TDB)')
+    plt.ylabel('Residuo radial |r_sim - r_jpl| [km]')
+    plt.title('Residuo radial entre simulación y JPL (por hora)')
+    plt.grid(True)
+    plt.savefig(f"{save_prefix}_residual_radial.png", dpi=300, bbox_inches='tight')
+    plt.show()
+    # Print simple RMS
+    rms = np.sqrt(np.mean(resid_radial**2))
+    print(f"RMS residual radial (km): {rms:.6f}")
+    return {
+        't_plot': t_plot,
+        'times_plot_dt': times_plot_dt,
+        'X_sim': X_sim_resamp, 'Y_sim': Y_sim_resamp, 'Z_sim': Z_sim_resamp,
+        'X_jpl': X_jpl, 'Y_jpl': Y_jpl, 'Z_jpl': Z_jpl,
+        'resid_radial': resid_radial, 'rms_km': rms
+    }
+
+# ---------------- Main ----------------
+if _name_ == "_main_":
+    files_map = {
+        'Mercury': 'MercurioTotal.xlsx',
+        'Venus': 'VenusTotal.xlsx',
+        'Earth': 'EarthTotal.xlsx',
+        'Jupiter': 'JupiterTotal.xlsx'
+    }
+    # integration interval & hourly step
+    start_str = "2025-07-23 00:00:00"
+    end_str   = "2025-10-19 00:00:00"
+    res = integrate_and_compare(start_str, end_str, dt_seconds=3600, files_map=files_map, save_prefix="mercury_compare")
+    print("Finished. RMS residual (km):", res['rms_km'])
