@@ -1,0 +1,260 @@
+# simulate_planets_sun_only_with_trails.py
+# Simulate Mercury, Venus, Earth, Jupiter around the Sun (Sun central gravity only).
+# Reads 1925 elements from Excel files (Mercury1.xlsx, Venus1.xlsx, Earth1.xlsx, Jupiter1.xlsx).
+# Integrates from 1925 -> 2025 and animates orbits with short trailing tails and option to save.
+# Units: distances in km, time in seconds, GMsun in km^3/s^2
+
+import numpy as np
+import pandas as pd
+from math import sin, cos
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+import os
+import warnings
+
+# -------------------------
+# Physical constants (km, s)
+# -------------------------
+GMsun = 1.32712440018e11  # km^3 / s^2
+
+# -------------------------
+# Helper: orbital elements -> state vector (r, v) in heliocentric ecliptic frame
+# -------------------------
+def elements_to_state(a, e, inc_deg, Omega_deg, omega_deg, nu_deg, mu=GMsun):
+    # convert angles
+    i = np.deg2rad(inc_deg)
+    Omega = np.deg2rad(Omega_deg)
+    omega = np.deg2rad(omega_deg)
+    nu = np.deg2rad(nu_deg)
+
+    # distance
+    r = a * (1 - e**2) / (1 + e * np.cos(nu))
+
+    # position in orbital plane (perifocal frame)
+    x_per = r * np.cos(nu)
+    y_per = r * np.sin(nu)
+    z_per = 0.0
+    r_per = np.array([x_per, y_per, z_per])
+
+    # specific angular momentum
+    p = a * (1 - e**2)  # semi-latus rectum
+    h = np.sqrt(mu * p)
+
+    # velocity in perifocal
+    vx_per = -np.sqrt(mu / p) * np.sin(nu)
+    vy_per =  np.sqrt(mu / p) * (e + np.cos(nu))
+    vz_per = 0.0
+    v_per = np.array([vx_per, vy_per, vz_per])
+
+    # rotation matrix from perifocal to inertial (ecliptic) frame
+    cosO = np.cos(Omega); sinO = np.sin(Omega)
+    cosw = np.cos(omega); sinw = np.sin(omega)
+    cosi = np.cos(i); sini = np.sin(i)
+
+    R11 = cosO * cosw - sinO * sinw * cosi
+    R12 = -cosO * sinw - sinO * cosw * cosi
+    R13 = sinO * sini
+    R21 = sinO * cosw + cosO * sinw * cosi
+    R22 = -sinO * sinw + cosO * cosw * cosi
+    R23 = -cosO * sini
+    R31 = sinw * sini
+    R32 = cosw * sini
+    R33 = cosi
+
+    R = np.array([[R11, R12, R13],
+                  [R21, R22, R23],
+                  [R31, R32, R33]])
+
+    r_vec = R @ r_per
+    v_vec = R @ v_per
+
+    return r_vec, v_vec
+
+# -------------------------
+# Gravitational acceleration due to Sun at origin
+# -------------------------
+def acc_sun(t, state):
+    # state: [x,y,z,vx,vy,vz] for one body
+    x, y, z, vx, vy, vz = state
+    r3 = (x*x + y*y + z*z) ** 1.5
+    if r3 == 0:
+        return [0,0,0,0,0,0]
+    ax = -GMsun * x / r3
+    ay = -GMsun * y / r3
+    az = -GMsun * z / r3
+    return [vx, vy, vz, ax, ay, az]
+
+# -------------------------
+# Read first-row elements from Excel
+# -------------------------
+def read_first_row_elements(filename):
+    # expects the same layout you showed: skip 1 header row, then first row is 1925
+    df = pd.read_excel(filename, skiprows=1, engine='openpyxl')
+    row = df.iloc[0]
+    a = float(row['A'])
+    e = float(row['EC'])
+    inc = float(row['IN'])
+    Omega = float(row['OM'])
+    omega = float(row['W'])
+    TA = float(row['TA'])
+    return a, e, inc, Omega, omega, TA
+
+# -------------------------
+# Main simulation wrapper
+# -------------------------
+def simulate_planets(file_map, t0_year=1925, t_end_year=2025, dt_days=1.0, verbose=True):
+    """
+    file_map: dict name -> filename, e.g. {'Mercury':'Mercury1.xlsx', 'Venus':...}
+    returns: dict of trajectories: name -> dict with times (s), positions arrays
+    """
+    # Prepare initial states
+    init_states = {}
+    for name, fname in file_map.items():
+        a, e, inc, Omega, omega, TA = read_first_row_elements(fname)
+        r0, v0 = elements_to_state(a, e, inc, Omega, omega, TA)
+        state0 = np.hstack((r0, v0))  # [x,y,z,vx,vy,vz]
+        init_states[name] = {'a':a, 'e':e, 'inc':inc, 'Omega':Omega, 'omega':omega, 'TA':TA, 'state0':state0}
+
+    # Integration times (seconds)
+    days_total = (t_end_year - t0_year) * 365.25
+    tspan_secs = days_total * 86400.0
+    dt = dt_days * 86400.0
+    t_eval = np.arange(0.0, tspan_secs + 1.0, dt)
+
+    results = {}
+    for name, info in init_states.items():
+        if verbose:
+            print(f"Integrating {name} for {t_end_year - t0_year} years, steps: {len(t_eval)}")
+        y0 = info['state0']
+
+        sol = solve_ivp(fun=acc_sun, t_span=(0.0, tspan_secs), y0=y0, t_eval=t_eval,
+                        rtol=1e-9, atol=1e-12, method='DOP853')
+
+        if not sol.success:
+            warnings.warn(f"Integration for {name} failed: {sol.message}")
+
+        # positions in km
+        X = sol.y[0,:]; Y = sol.y[1,:]; Z = sol.y[2,:]
+        # store
+        results[name] = {'t': sol.t, 'X': X, 'Y': Y, 'Z': Z, 'a':info['a']}
+    return results
+
+# -------------------------
+# Animation function with trail and save
+# -------------------------
+def animate_trajectories(results, t0_year=1925, step=10, trail_fraction=0.10, save_file=None, fps=30, interval=30):
+    """
+    Plot/animate the orbits stored in results (from simulate_planets).
+    - step: use every step-th data point (speed-up). e.g. step=10 means show data indices 0,10,20,...
+    - trail_fraction: fraction of total samples to show behind each planet as a tail (0.10 = 10%)
+    - save_file: if not None, filename to save mp4 (ffmpeg required)
+    - fps: frames per second for saved video
+    - interval: ms between frames when showing live
+    """
+    names = list(results.keys())
+    colors = {'Mercur':'orange', 'Venus':'green', 'Earth':'blue', 'Jupiter':'brown'}
+    fig = plt.figure(figsize=(9,9))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # decide axes limits from data (symmetric)
+    all_x = np.hstack([results[n]['X'] for n in names])
+    all_y = np.hstack([results[n]['Y'] for n in names])
+    all_z = np.hstack([results[n]['Z'] for n in names])
+    Rmax = np.max(np.sqrt(all_x*2 + all_y2 + all_z*2))
+    lim = Rmax * 1.05
+    ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_zlim(-lim/10, lim/10)
+
+    ax.set_xlabel('X [km]'); ax.set_ylabel('Y [km]'); ax.set_zlabel('Z [km]')
+    total_years = t0_year + (results[names[0]]["t"][-1]/86400)/365.25
+    # ax.set_title(f'Anim (Sun-only) {t0_year} → {int(total_years)}')
+
+    # plot Sun
+    ax.scatter(0,0,0, color='yellow', s=200, label='Sun (center)')
+
+    # Precompute line & dot objects
+    orbit_lines = {}
+    planet_dots = {}
+    for name in names:
+        line, = ax.plot([], [], [], color=colors.get(name,'k'), lw=1.8, alpha=0.9, label=name)
+        dot, = ax.plot([], [], [], marker='o', color=colors.get(name,'k'), markersize=5)
+        orbit_lines[name] = line
+        planet_dots[name] = dot
+
+    ax.legend(loc='upper right')
+
+    # pick frame indices with skipping
+    t_array = results[names[0]]['t']
+    Nt = len(t_array)
+    if step < 1:
+        step = 1
+    frame_indices = np.arange(0, Nt, step)
+    frames = frame_indices.tolist()
+
+    # trail length in data points (absolute, not frames). user wanted 10% of total orbit
+    trail_length = max(2, int(trail_fraction * Nt))
+
+    # For annotation: convert t (s) -> year
+    years = t0_year + (t_array / 86400.0) / 365.25
+    year_text = ax.text2D(0.05, 0.95, "", transform=ax.transAxes, fontsize=12)
+
+    def update(data_idx):
+        # data_idx is the actual sample index in arrays
+        for name in names:
+            X = results[name]['X']; Y = results[name]['Y']; Z = results[name]['Z']
+            idx = int(data_idx)
+            start_idx = max(0, idx - trail_length + 1)
+            # set tail (last trail_length points)
+            xs = X[start_idx:idx+1]
+            ys = Y[start_idx:idx+1]
+            zs = Z[start_idx:idx+1]
+            orbit_lines[name].set_data(xs, ys)
+            orbit_lines[name].set_3d_properties(zs)
+            # current position dot
+            planet_dots[name].set_data([X[idx]], [Y[idx]])
+            planet_dots[name].set_3d_properties([Z[idx]])
+        year_text.set_text(f"Year: {years[idx]:.2f}")
+        return list(orbit_lines.values()) + list(planet_dots.values()) + [year_text]
+
+    ani = FuncAnimation(fig, update, frames=frames, interval=interval, blit=False)
+
+    if save_file:
+        # ensure the directory exists
+        basedir = os.path.dirname(save_file)
+        if basedir and not os.path.exists(basedir):
+            os.makedirs(basedir, exist_ok=True)
+        print(f"Saving animation to {save_file} (this may take a moment)...")
+        try:
+            # writer 'ffmpeg' required
+            ani.save(save_file, writer='ffmpeg', fps=fps, dpi=200)
+            print("Saved animation successfully.")
+        except Exception as e:
+            print("Error saving animation:", e)
+            print("Make sure ffmpeg is installed and on PATH. Attempting fallback save with default writer...")
+            try:
+                ani.save(save_file, fps=fps, dpi=200)
+                print("Saved animation (fallback).")
+            except Exception as e2:
+                print("Fallback save failed:", e2)
+    plt.show()
+
+# -------------------------
+# Example usage (main)
+# -------------------------
+if _name_ == "_main_":
+    # Map planet name -> its Excel file with elements (first-row = 1925)
+    files = {
+        'Mercury': 'Mercury1.xlsx',
+        'Venus':   'Venus1.xlsx',
+        'Earth':   'Earth1.xlsx',
+        'Jupiter': 'Jupiter1.xlsx'
+    }
+
+    # integrate 100 years with daily steps (you can change dt_days)
+    results = simulate_planets(files, t0_year=1925, t_end_year=2025, dt_days=1.0)
+
+    # animate (faster: step=10 means we show every 10th sample; trail_fraction=0.1 shows 10% tail)
+    # save_file: set to "orbits.mp4" to write an mp4 (ffmpeg required)
+    animate_trajectories(results, t0_year=1925, step=5, trail_fraction=0.10,
+                         save_file="mercury_orbits.mp4", fps=30, interval=30)
