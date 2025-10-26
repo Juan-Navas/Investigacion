@@ -1,0 +1,380 @@
+# compare_perihelia_error.py
+# Compara perihelia anual (ϖ) simulada vs experimental y grafica el error (arcsec)
+# Uso: python compare_perihelia_error.py
+# Requiere: numpy, pandas, scipy, matplotlib, openpyxl
+
+import numpy as np
+import pandas as pd
+from scipy.integrate import solve_ivp
+from scipy.stats import linregress
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+
+# ---------------- Constants ----------------
+GM = {
+    'Sun': 1.32712440018e11,    # km^3/s^2
+    'Mercury': 22031.868551,
+    'Venus': 324858.592000,
+    'Earth': 398600.435507,
+    'Jupiter': 126712764.8
+}
+c_km_s = 299792.458  # km/s
+J2_sun = 2.0e-7
+R_sun_km = 695700.0
+
+# ---------------- Elements <-> state ----------------
+def elements_to_state(a, e, inc_deg, Omega_deg, omega_deg, nu_deg, mu=GM['Sun']):
+    i = np.deg2rad(inc_deg); Omega = np.deg2rad(Omega_deg)
+    omega = np.deg2rad(omega_deg); nu = np.deg2rad(nu_deg)
+    p = a * (1 - e**2)
+    r = p / (1 + e * np.cos(nu))
+    r_pf = np.array([r * np.cos(nu), r * np.sin(nu), 0.0])
+    v_pf = np.array([-np.sqrt(mu/p) * np.sin(nu), np.sqrt(mu/p) * (e + np.cos(nu)), 0.0])
+    cosO = np.cos(Omega); sinO = np.sin(Omega)
+    cosw = np.cos(omega); sinw = np.sin(omega)
+    cosi = np.cos(i); sini = np.sin(i)
+    R = np.array([
+        [ cosO*cosw - sinO*sinw*cosi,  -cosO*sinw - sinO*cosw*cosi,  sinO*sini],
+        [ sinO*cosw + cosO*sinw*cosi,  -sinO*sinw + cosO*cosw*cosi, -cosO*sini],
+        [ sinw*sini,                     cosw*sini,                   cosi     ]
+    ])
+    r_vec = R @ r_pf
+    v_vec = R @ v_pf
+    return r_vec, v_vec
+
+def state_to_elements(r_vec, v_vec, mu=GM['Sun']):
+    r = np.array(r_vec); v = np.array(v_vec)
+    r_norm = np.linalg.norm(r); v_norm = np.linalg.norm(v)
+    h = np.cross(r, v); h_norm = np.linalg.norm(h)
+    K = np.array([0.,0.,1.])
+    n = np.cross(K, h); n_norm = np.linalg.norm(n)
+    # eccentricity vector
+    e_vec = (1/mu) * ((v_norm**2 - mu/r_norm) * r - np.dot(r, v) * v)
+    e = np.linalg.norm(e_vec)
+    # semi-major axis
+    eps = v_norm**2/2 - mu/r_norm
+    a = -mu / (2*eps) if abs(eps) > 1e-16 else np.inf
+    # inclination
+    i_deg = np.rad2deg(np.arccos(h[2]/h_norm))
+    # longitude of ascending node
+    Omega_deg = 0.0
+    if n_norm > 1e-12:
+        Omega_deg = (np.rad2deg(np.arctan2(n[1], n[0])) ) % 360.0
+    # argument of perihelion
+    omega_deg = 0.0
+    if n_norm > 1e-12 and e > 1e-12:
+        cosw = np.clip(np.dot(n, e_vec)/(n_norm*e), -1.0, 1.0)
+        omega_deg = np.rad2deg(np.arccos(cosw))
+        if np.dot(np.cross(n, e_vec), h) < 0:
+            omega_deg = 360.0 - omega_deg
+    elif e > 1e-12:
+        omega_deg = np.rad2deg(np.arctan2(e_vec[1], e_vec[0])) % 360.0
+    # true anomaly
+    nu_deg = 0.0
+    if e > 1e-12:
+        cosnu = np.clip(np.dot(e_vec, r)/(e*r_norm), -1.0, 1.0)
+        nu_deg = np.rad2deg(np.arccos(cosnu))
+        if np.dot(r, v) < 0:
+            nu_deg = 360.0 - nu_deg
+    return a, e, i_deg, Omega_deg, omega_deg, nu_deg
+
+# ---------------- J2 on Mercury ----------------
+def acc_J2_on_body(r_rel, J2=J2_sun, R=R_sun_km, mu=GM['Sun'], k_unit=np.array([0.,0.,1.])):
+    r = np.array(r_rel)
+    r_norm = np.linalg.norm(r)
+    if r_norm == 0.0:
+        return np.zeros(3)
+    s = np.dot(k_unit, r)
+    a1 = - (3.0 * mu * J2 * R*2) / (2.0 * r_norm7) * ( (r_norm2 - 5.0*s*2) * r )
+    a2 = - (3.0 * mu * J2 * R*2) / ( r_norm*5 ) * s * k_unit
+    return a1 + a2
+
+# ---------------- 1PN correction (Schwarzschild) para Mercury ----------------
+def acc_1PN_schwarzschild(r_rel, v_rel, mu=GM['Sun'], c=c_km_s):
+    r = np.array(r_rel); v = np.array(v_rel)
+    r_norm = np.linalg.norm(r)
+    if r_norm == 0.0:
+        return np.zeros(3)
+    v2 = np.dot(v, v)
+    rdotv = np.dot(r, v)
+    pref = mu / (c*2 * r_norm*3)
+    term_r = (4.0 * mu / r_norm - v2) * r
+    term_v = 4.0 * rdotv * v
+    return pref * (term_r + term_v)
+
+# ---------------- Read experimental file (annual elements) ----------------
+def parse_horizons_date(s):
+    if pd.isna(s):
+        return None
+    s = str(s).strip()
+    s = s.replace("A.D.", "").replace("A.D", "").strip()
+    s = " ".join(s.split())
+    # Try common HORIZONS formats
+    for fmt in ("%Y-%b-%d %H:%M:%S.%f", "%Y-%b-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            pass
+    # Fallback iso
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+def read_experimental_varpi(filename):
+    """Lee el archivo anual (Osculating elements) y devuelve arrays: years_float, varpi_deg"""
+    df = pd.read_excel(filename, skiprows=1, engine='openpyxl')
+    if 'Calendar Date (TDB)' not in df.columns:
+        raise ValueError("No 'Calendar Date (TDB)' column found in experimental file.")
+    # parse dates
+    cal_dates = df['Calendar Date (TDB)'].astype(str).apply(parse_horizons_date)
+    # compute year as float
+    years = np.array([ (dt.year + (dt.timetuple().tm_yday-1)/365.25 + dt.hour/24.0/365.25) if dt is not None else np.nan for dt in cal_dates ])
+    # extract OM and W and compute varpi
+    OM = df['OM'].astype(float).to_numpy()
+    W  = df['W'].astype(float).to_numpy()
+    varpi = (OM + W) % 360.0
+    # unwrap continuous
+    varpi_unw = np.rad2deg(np.unwrap(np.deg2rad(varpi)))
+    return years, varpi_unw, cal_dates
+
+# ---------------- Read first-row elements (to create initial condition) ------------
+def read_first_row_elements_xlsx(filename):
+    df = pd.read_excel(filename, skiprows=1, engine='openpyxl')
+    row = df.iloc[0]
+    a = float(row['A']); e = float(row['EC'])
+    inc = float(row['IN']); Om = float(row['OM'])
+    w = float(row['W']); TA = float(row['TA'])
+    return a, e, inc, Om, w, TA
+
+# ---------------- Build initial state from first-row of given files ----------------
+def build_initial_state(file_map):
+    names = []
+    states = []
+    for name, fname in file_map:
+        names.append(name)
+        if name == 'Sun':
+            r0 = np.array([0.0,0.0,0.0]); v0 = np.array([0.0,0.0,0.0])
+        else:
+            a,e,inc,Om,w,TA = read_first_row_elements_xlsx(fname)
+            r0, v0 = elements_to_state(a,e,inc,Om,w,TA)
+        states.append(np.hstack((r0, v0)))
+    y0 = np.hstack(states)
+    return names, y0
+
+# ---------------- N-body derivative with optional J2 and 1PN on Mercury ----------------
+def nbody_derivative(t, y, names, gm_dict, use_J2_mercury=True, J2_val=J2_sun, use_1PN_mercury=True):
+    N = len(names)
+    dydt = np.zeros_like(y)
+    pos = y.reshape(N,6)[:,0:3]
+    vel = y.reshape(N,6)[:,3:6]
+    acc = np.zeros_like(pos)
+    # mutual Newtonian acceleration
+    for i in range(N):
+        ri = pos[i]
+        ai = np.zeros(3)
+        for j in range(N):
+            if i == j: continue
+            rj = pos[j]
+            r_ij = ri - rj
+            dist3 = np.linalg.norm(r_ij)**3
+            if dist3 == 0: continue
+            mu_j = gm_dict[names[j]]
+            ai += - mu_j * r_ij / dist3
+        acc[i] = ai
+    # J2 on Mercury only
+    if use_J2_mercury:
+        try:
+            im = names.index('Mercury'); isun = names.index('Sun')
+            r_rel = pos[im] - pos[isun]
+            a_j2 = acc_J2_on_body(r_rel, J2=J2_val, R=R_sun_km, mu=gm_dict['Sun'])
+            acc[im] += a_j2
+        except ValueError:
+            pass
+    # 1PN on Mercury only (Schwarzschild)
+    if use_1PN_mercury:
+        try:
+            im = names.index('Mercury'); isun = names.index('Sun')
+            r_rel = pos[im] - pos[isun]
+            v_rel = vel[im] - vel[isun]
+            a_1pn = acc_1PN_schwarzschild(r_rel, v_rel, mu=gm_dict['Sun'], c=c_km_s)
+            acc[im] += a_1pn
+        except ValueError:
+            pass
+    # pack derivatives
+    for i in range(N):
+        idx = 6*i
+        dydt[idx:idx+3] = vel[i]
+        dydt[idx+3:idx+6] = acc[i]
+    return dydt
+
+# ---------------- Find perihelia from Mercury-Sun distance ----------------
+def find_perihelia_indices(sol, idx_mercury, idx_sun, min_sep_days=30):
+    # sol.y shaped (6*N, Nt)
+    Nt = sol.y.shape[1]
+    pos = sol.y.reshape(-1,6,Nt)[:,:,0:3]  # (N,6,Nt) then [:,0:3,:] -> (N,3,Nt) but reshape trick below:
+    # simpler:
+    N = sol.y.shape[0] // 6
+    pos = sol.y.reshape(N,6,Nt)[:,0:3,:]  # (N,3,Nt)
+    r_mer_rel = pos[idx_mercury,:,:] - pos[idx_sun,:,:]  # (3, Nt)
+    rnorm = np.linalg.norm(r_mer_rel, axis=0)
+    minima = []
+    for k in range(1, Nt-1):
+        if rnorm[k] < rnorm[k-1] and rnorm[k] < rnorm[k+1]:
+            minima.append(k)
+    # filter by min separation
+    dt = sol.t[1] - sol.t[0]
+    min_sep_idx = int(max(1, (min_sep_days*86400.0) / dt))
+    filtered = []
+    last = -999999
+    for idx in minima:
+        if idx - last >= min_sep_idx:
+            filtered.append(idx)
+            last = idx
+    return np.array(filtered, dtype=int), rnorm
+
+# ---------------- Main workflow: integrate, compute varpi at perihelia, compare with experimental file -----------
+def run_and_compare_perihelia(files, experimental_mercury_file, t_start_year=1925, t_years=100, dt_days=1.0,
+                              use_J2_mercury=True, use_1PN_mercury=True):
+    # Read experimental varpi (year floats and varpi deg)
+    years_exp, varpi_exp_deg, cal_dates = read_experimental_varpi(experimental_mercury_file)
+    # determine integration span from experimental data if possible
+    # use the range of years where experimental has values (non-NaN)
+    mask_valid = ~np.isnan(years_exp)
+    if mask_valid.sum() > 1:
+        start_year = int(np.floor(years_exp[mask_valid].min()))
+        end_year   = int(np.ceil(years_exp[mask_valid].max()))
+        t_years = end_year - start_year
+        t_start_year = start_year
+        print(f"Detected experimental range: {start_year} -> {end_year}; setting integration span to {t_years} years starting {t_start_year}")
+    else:
+        print("Experimental years not detected cleanly; using provided t_start_year/t_years")
+
+    # Build initial state from first-row of files (assumes first row matches start epoch)
+    names, y0 = build_initial_state(files)
+    N = len(names)
+    # integration times (seconds)
+    t0 = 0.0
+    t_end = t_years * 365.25 * 86400.0
+    dt = dt_days * 86400.0
+    t_eval = np.arange(t0, t_end+0.1*dt, dt)
+    print(f"Integrating {t_years} years ({len(t_eval)} steps), dt={dt_days} days")
+
+    sol = solve_ivp(lambda t,y: nbody_derivative(t,y,names,GM,use_J2_mercury,J2_sun,use_1PN_mercury),
+                    (t0, t_end), y0, t_eval=t_eval, rtol=1e-9, atol=1e-12, method='DOP853')
+    if not sol.success:
+        raise RuntimeError("Integration failed: " + sol.message)
+
+    # find perihelia indices
+    idx_mer = names.index('Mercury'); idx_sun = names.index('Sun')
+    peri_idxs, rnorm = find_perihelia_indices(sol, idx_mer, idx_sun, min_sep_days=30)
+    peri_times_s = sol.t[peri_idxs]
+    years_sim_peri = t_start_year + (peri_times_s / 86400.0) / 365.25
+    print(f"Detected {len(peri_idxs)} perihelia from simulation; years range {years_sim_peri[0]:.3f} -> {years_sim_peri[-1]:.3f}")
+
+    # compute varpi (Omega + omega) from simulated states at each perihelion
+    varpi_sim_deg = []
+    for idx in peri_idxs:
+        r_mer = sol.y[6*idx_mer + 0:6*idx_mer + 3, idx]
+        v_mer = sol.y[6*idx_mer + 3:6*idx_mer + 6, idx]
+        r_sun = sol.y[0:3, idx]   # Sun is first body
+        v_sun = sol.y[3:6, idx]
+        r_rel = r_mer - r_sun
+        v_rel = v_mer - v_sun
+        a, e, inc, Om, w, nu = state_to_elements(r_rel, v_rel, mu=GM['Sun'])
+        varpi_sim_deg.append((Om + w) % 360.0)
+    varpi_sim_deg = np.array(varpi_sim_deg)
+    varpi_sim_unw = np.rad2deg(np.unwrap(np.deg2rad(varpi_sim_deg)))
+
+    # Now prepare experimental varpi for the same years: years_exp, varpi_exp_deg already read
+    # We'll match each experimental year (where there is a value) to the nearest simulated perihelion in time
+    years_list_exp = years_exp[mask_valid]
+    varpi_list_exp = varpi_exp_deg[mask_valid]
+    # Create arrays for matched simulated varpi
+    matched_sim_varpi = np.full(len(years_list_exp), np.nan)
+    matched_sim_years = np.full(len(years_list_exp), np.nan)
+    used_indices = set()
+    for i, year_e in enumerate(years_list_exp):
+        # find nearest perihelion index
+        diffs = np.abs(years_sim_peri - year_e)
+        if diffs.size == 0:
+            continue
+        j = int(np.argmin(diffs))
+        # Optionally ensure uniqueness: if already used, find next nearest
+        # find smallest j not in used_indices
+        order = np.argsort(diffs)
+        chosen = None
+        for jj in order:
+            if jj not in used_indices:
+                chosen = jj
+                break
+        if chosen is None:
+            chosen = order[0]
+        used_indices.add(chosen)
+        matched_sim_varpi[i] = varpi_sim_unw[chosen]
+        matched_sim_years[i] = years_sim_peri[chosen]
+
+    # Compute angular difference (sim - exp) in degrees, then convert to arcsec
+    # Need to handle wrapping: difference in (-180,180]
+    delta_deg = (matched_sim_varpi - varpi_list_exp)
+    # wrap to (-180,180]
+    delta_deg = ((delta_deg + 180.0) % 360.0) - 180.0
+    delta_arcsec = delta_deg * 3600.0
+
+    # Plot 1: experimental vs simulated varpi (deg)
+    plt.figure(figsize=(10,5))
+    plt.plot(years_list_exp, varpi_list_exp, 'o-', label='ϖ experimental (JPL)', color='tab:blue')
+    plt.plot(years_list_exp, matched_sim_varpi, 'x--', label='ϖ sim (matched perihelia)', color='tab:orange')
+    plt.xlabel('Year')
+    plt.ylabel('Longitud de perihelio ϖ [deg]')
+    plt.title('ϖ experimental vs ϖ simulado (perihelia emparejadas)')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("varpi_exp_vs_sim.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # Plot 2: error vs year (arcsec)
+    plt.figure(figsize=(10,4))
+    plt.plot(years_list_exp, delta_arcsec, 'o-', color='purple')
+    plt.axhline(0, color='k', lw=0.6)
+    plt.xlabel('Year')
+    plt.ylabel('Δϖ = ϖ_sim − ϖ_exp [arcsec]')
+    plt.title('Error angular perihelio: simulación − experimental')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("delta_varpi_arcsec.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # Print summary stats
+    valid_mask = ~np.isnan(delta_arcsec)
+    if np.any(valid_mask):
+        rms = np.sqrt(np.mean(delta_arcsec[valid_mask]**2))
+        mean_err = np.mean(delta_arcsec[valid_mask])
+        print(f"Mean error (arcsec): {mean_err:.6f}; RMS (arcsec): {rms:.6f}; N={valid_mask.sum()}")
+    else:
+        print("No valid matched delta_varpi values found.")
+
+    # return useful arrays
+    return {
+        'years_exp': years_list_exp,
+        'varpi_exp_deg': varpi_list_exp,
+        'years_sim_peri': years_sim_peri,
+        'varpi_sim_deg': varpi_sim_unw,
+        'matched_sim_varpi': matched_sim_varpi,
+        'delta_arcsec': delta_arcsec
+    }
+
+# ---------------- Example run ----------------
+if _name_ == "_main_":
+    files = [
+        ('Sun', None),
+        ('Mercury', 'Mercury1.xlsx'),
+        ('Venus', 'Venus1.xlsx'),
+        ('Earth', 'Earth1.xlsx'),
+        ('Jupiter', 'Jupiter1.xlsx')
+    ]
+    res = run_and_compare_perihelia(files, experimental_mercury_file='Mercury1.xlsx',
+                                    t_start_year=1925, t_years=100, dt_days=1.0,
+                                    use_J2_mercury=True, use_1PN_mercury=True)
+    print("Finished. Check varpi_exp_vs_sim.png and delta_varpi_arcsec.png")
